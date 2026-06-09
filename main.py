@@ -22,7 +22,7 @@ from telegram.ext import (
 # 1. Initialize environments and system logging infrastructure
 load_dotenv()
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ try:
     # Explicitly enforce gspread native service account parsing
     gc, authorized_client = gspread.oauth_from_dict, None
     gc = gspread.service_account(filename="credentials.json")
-    
+
     # Open the spreadsheet and grab handles for BOTH tabs
     spreadsheet = gc.open("Hotel_Operations_Log")
     sheet = spreadsheet.worksheet("Active_Issues")
@@ -55,6 +55,7 @@ except Exception as e:
 
 # Pull operational variables safely from runtime configurations
 AUNT_ID = int(os.environ.get("AUNT_TELEGRAM_ID", 0))
+KUYA_GARET_ID = int(os.environ.get("KUYA_GARET_ID", 0))  # Loaded your new admin ID
 
 SYSTEM_INSTRUCTION = (
     "You are an expert hotel operations routing manager. Your task is to analyze raw "
@@ -74,7 +75,7 @@ async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYP
     """Intercepts messy worker strings, uses Gemini to clean up records, and generates logs."""
     raw_text = update.message.text
     sender = update.message.from_user.first_name
-    
+
     # Notify reporter that request is being parsed asynchronously
     status_indicator = await update.message.reply_text("🔄 AI processing incident parameters...")
 
@@ -89,7 +90,7 @@ async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYP
                 system_instruction=SYSTEM_INSTRUCTION
             ),
         )
-        
+
         parsed_data = json.loads(response.text)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -104,7 +105,7 @@ async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYP
                 sender,
                 "Pending" # Default status configuration
             ])
-        
+
         # Format the beautiful, concise string block your aunt will read on her phone
         alert_payload = (
             f"🚨 **New Operational Report**\n\n"
@@ -123,6 +124,10 @@ async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYP
             [
                 InlineKeyboardButton("🧹 Housekeeping", callback_data="dispatch_housekeeping"),
                 InlineKeyboardButton("🔧 Maintenance", callback_data="dispatch_maintenance")
+            ],
+            [
+                InlineKeyboardButton("👤 Contact Admin (Garet)", callback_data="dispatch_admin"),
+                InlineKeyboardButton("👤 Contact Admin (Mariel)",callback_data="dispatch_admin2")
             ],
             [InlineKeyboardButton("❌ Dismiss / Archive Task", callback_data="dispatch_dismiss")]
         ]
@@ -148,6 +153,9 @@ async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT
     original_text = query.message.text
     selection_path = query.data
 
+    # Save the current keyboard structure so we can keep it alive upon routing failure
+    current_keyboard = query.message.reply_markup
+
     # Read the staff roster from your running database or sheet mappings dynamically
     try:
         roster_sheet = gc.open("Hotel_Operations_Log").worksheet("Staff_Roster")
@@ -156,17 +164,35 @@ async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT
         roster = {row['Role'].lower(): int(row['Telegram_ID']) for row in records}
     except Exception:
         # Local static mock fallback if sheet mapping fails during initialization
-        roster = {"housekeeping": AUNT_ID, "maintenance": AUNT_ID} 
+        roster = {}
 
     if selection_path == "dispatch_maintenance":
-        target_id = roster.get("maintenance", AUNT_ID)
+        target_id = roster.get("maintenance")
+        department_name = "Maintenance"
         confirmation_msg = "🔧 **Routed directly to Maintenance Lead.**"
     elif selection_path == "dispatch_housekeeping":
-        target_id = roster.get("housekeeping", AUNT_ID)
+        target_id = roster.get("housekeeping")
+        department_name = "Housekeeping"
         confirmation_msg = "🧹 **Routed directly to Housekeeping Lead.**"
+    elif selection_path == "dispatch_admin":
+        target_id = roster.get("garet")
+        department_name = "Admin (Garet)"
+        confirmation_msg = "👤 **Escalated straight to Admin (Kuya Garet).**"
+    elif selection_path == "dispatch_admin2":
+        target_id = roster.get("mariel")
+        department_name = "Admin (Mariel)"
+        confirmation_msg = "👤 **Escalated straight to Admin (Mariel).**"
     else:
         # Dismiss selected
         await query.edit_message_text(text=f"{original_text}\n\n🗑️ **Alert closed without routing.**")
+        return
+
+    # Fallback Handling: Check if we actually found a valid ID inside the Staff Roster tab
+    if not target_id:
+        await query.edit_message_text(
+            text=f"{original_text}\n\n⚠️ **Routing Failed:** Could not find an ID mapping for '{department_name}' in the Staff Roster spreadsheet tab.",
+            reply_markup=current_keyboard
+        )
         return
 
     # Forward the clear work instructions directly to the specific worker's private DM box
@@ -176,10 +202,11 @@ async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT
             text=f"📥 **Incoming Work Order Assignment:**\n\n{original_text}"
         )
         # Re-render your aunt's chat screen to cleanly wipe buttons and display clear dispatch status
-        await query.edit_message_text(text=f"{original_alert}\n\n✅ {confirmation_msg}")
+        await query.edit_message_text(text=f"{original_text}\n\n✅ {confirmation_msg}")
     except Exception:
         await query.edit_message_text(
-            text=f"{original_text}\n\n❌ **Routing Blocked:** Target employee has not initialized or pressed 'Start' on this bot yet."
+            text=f"{original_text}\n\n❌ **Routing Blocked:** {department_name} has not initialized or pressed 'Start' on this bot yet.",
+            reply_markup=current_keyboard
         )
 
 if __name__ == '__main__':
@@ -187,7 +214,16 @@ if __name__ == '__main__':
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     print(f"DEBUG: Token loaded = {repr(token)}")
     print(f"DEBUG: Token length = {len(token) if token else 'None'}")
-    app = Application.builder().token(token).build()
+
+    # Establish PythonAnywhere internal proxy configurations to bypass the 503 drops
+    proxy_url = "http://proxy.server:3128"
+    app = (
+        Application.builder()
+        .token(token)
+        .proxy(proxy_url)
+        .get_updates_proxy(proxy_url)
+        .build()
+    )
 
     # Link incoming message signatures to core handlers
     app.add_handler(CommandHandler("start", start))
