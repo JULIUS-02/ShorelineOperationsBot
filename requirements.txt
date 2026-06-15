@@ -1,2 +1,4 @@
-pygame==2.6.1
-pygame-ce==2.5.5
+python-telegram-bot==21.10
+flask==3.0.3
+gspread==6.1.2
+google-auth==2.30.0
