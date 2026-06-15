@@ -264,3 +264,18 @@ if __name__ == '__main__':
 
     print("🚀 Multi-Hotel Tracking System Engine Online. Running...")
     app.run_polling()
+
+from threading import Thread
+from flask import Flask
+
+app_flask = Flask('')
+
+@app_flask.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_flask():
+    app_flask.run(host='0.0.0.0', port=8080)
+
+# Inside your main execution block, spin up the server thread right before polling:
+Thread(target=run_flask).start()
