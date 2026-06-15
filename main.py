@@ -30,6 +30,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- FIX: Declare variables globally ---
+gc = None
+sheet = None
+
 # 2. Refined strict Pydantic Schema for Multi-Hotel Management
 class HotelIssue(BaseModel):
     hotel_name: str = Field(description="The specific hotel branch named (e.g., 'Mango Valley', 'Apex', etc.). Use 'Unknown' if not stated.")
@@ -41,22 +45,26 @@ class HotelIssue(BaseModel):
 # 3. Instantiate Google API Clients
 gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-# Fix: Load Google Credentials directly from Render Environment Variable
-try:
-    google_creds = os.environ.get('GOOGLE_CREDENTIALS')
-    if google_creds:
-        creds_dict = json.loads(google_creds)
-        gc = gspread.service_account_from_dict(creds_dict)
-        spreadsheet = gc.open("Hotel_Operations_Log")
-        sheet = spreadsheet.worksheet("Active_Issues")
-        print("✅ Database Connection Established. Google Sheets connected successfully!")
-    else:
-        print("❌ Error: GOOGLE_CREDENTIALS environment variable not found. Check Render Dashboard.")
+# --- FIX: Connection logic in a function to allow re-connection ---
+def connect_google():
+    global gc, sheet
+    try:
+        google_creds = os.environ.get('GOOGLE_CREDENTIALS')
+        if google_creds:
+            creds_dict = json.loads(google_creds)
+            gc = gspread.service_account_from_dict(creds_dict)
+            spreadsheet = gc.open("Hotel_Operations_Log")
+            sheet = spreadsheet.worksheet("Active_Issues")
+            print("✅ Database Connection Established. Google Sheets connected successfully!")
+        else:
+            print("❌ Error: GOOGLE_CREDENTIALS environment variable not found. Check Render Dashboard.")
+            sheet = None
+    except Exception as e:
+        logger.error(f"Google Sheets Auth Error: {str(e)}.")
         sheet = None
-except Exception as e:
-    import traceback
-    logger.error(f"Google Sheets Auth Error: {str(e)}.")
-    sheet = None
+
+# Initial connection call
+connect_google()
 
 # Pull operational variables safely from runtime configurations
 AUNT_ID = int(os.environ.get("AUNT_TELEGRAM_ID", 0))
@@ -79,6 +87,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Intercepts messy worker strings, uses Gemini to clean up records, and generates logs."""
+    global sheet
+    # --- FIX: Re-check connection if lost ---
+    if sheet is None: connect_google()
+
     raw_text = update.message.text
     sender = update.message.from_user.first_name
 
@@ -99,7 +111,6 @@ async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYP
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         combined_location = f"{parsed_data.get('hotel_name')} - {parsed_data.get('room_number')}"
 
-        # Step 2: Log data into Google Sheets and find out exactly what row it landed on
         target_row_index = 0
         if sheet:
             update_res = sheet.append_row([
@@ -117,7 +128,6 @@ async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception:
                 target_row_index = len(sheet.get_all_values())
 
-        # Build message string block
         alert_payload = (
             f"🚨 **New Operational Report**\n\n"
             f"🏨 **Hotel Property:** {parsed_data.get('hotel_name')}\n"
@@ -157,6 +167,9 @@ async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Monitors clicks on administrative dispatch menus and worker resolutions."""
+    global gc, sheet
+    if gc is None: connect_google()
+    
     query = update.callback_query
     await query.answer()
 
@@ -164,26 +177,18 @@ async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT
     selection_path = query.data
     current_keyboard = query.message.reply_markup
 
-    # Close-loop check: If a worker clicked 'Resolve' from their direct assignment box
     if selection_path.startswith("worker_resolve_"):
         sheet_row = selection_path.replace("worker_resolve_", "")
-
         try:
             if sheet and sheet_row.isdigit():
                 sheet.update_cell(int(sheet_row), 7, "Resolved")
-
             await query.edit_message_text(text=f"{original_text}\n\n✅ **Status: Marked as Resolved**")
-
-            await context.bot.send_message(
-                chat_id=AUNT_ID,
-                text=f"🍏 **Update:** A task has been marked as **Resolved**!\n\n{original_text}"
-            )
+            await context.bot.send_message(chat_id=AUNT_ID, text=f"🍏 **Update:** A task has been marked as **Resolved**!\n\n{original_text}")
         except Exception as sheet_err:
             logger.error(f"Failed to patch resolved cell row status: {sheet_err}")
-            await query.edit_message_text(text=f"{original_text}\n\n❌ Database connection timeout. Could not patch status.", reply_markup=current_keyboard)
+            await query.edit_message_text(text=f"{original_text}\n\n❌ Database connection timeout.", reply_markup=current_keyboard)
         return
 
-    # Dynamic Roster parsing from the spreadsheet
     try:
         roster_sheet = gc.open("Hotel_Operations_Log").worksheet("Staff_Roster")
         all_rows = roster_sheet.get_all_values()
@@ -192,8 +197,7 @@ async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT
             if len(row) >= 2:
                 role_key = str(row[0]).strip().lower()
                 id_val = str(row[1]).strip()
-                if id_val.isdigit():
-                    roster[role_key] = int(id_val)
+                if id_val.isdigit(): roster[role_key] = int(id_val)
     except Exception as err:
         logger.error(f"Spreadsheet Roster read error: {err}")
         roster = {}
@@ -202,82 +206,43 @@ async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT
     action_type = f"{parts[0]}_{parts[1]}"
     sheet_row = parts[2] if len(parts) > 2 else "0"
 
-    if action_type == "disp_maintenance":
-        target_id = roster.get("maintenance")
-        department_name = "Maintenance"
-        confirmation_msg = "🔧 **Routed directly to Maintenance Lead.**"
-    elif action_type == "disp_housekeeping":
-        target_id = roster.get("housekeeping")
-        department_name = "Housekeeping"
-        confirmation_msg = "🧹 **Routed directly to Housekeeping Lead.**"
-    elif action_type == "disp_admin":
-        target_id = roster.get("garet")
-        department_name = "Admin (Garet)"
-        confirmation_msg = "👤 **Escalated straight to Admin (Kuya Garet).**"
-    elif action_type == "disp_admin2":
-        target_id = roster.get("mariel")
-        department_name = "Admin (Mariel)"
-        confirmation_msg = "👤 **Escalated straight to Admin (Mariel).**"
+    mapping = {
+        "disp_maintenance": ("maintenance", "Maintenance", "🔧 **Routed directly to Maintenance Lead.**"),
+        "disp_housekeeping": ("housekeeping", "Housekeeping", "🧹 **Routed directly to Housekeeping Lead.**"),
+        "disp_admin": ("garet", "Admin (Garet)", "👤 **Escalated straight to Admin (Kuya Garet).**"),
+        "disp_admin2": ("mariel", "Admin (Mariel)", "👤 **Escalated straight to Admin (Mariel).**")
+    }
+
+    if action_type in mapping:
+        key, name, msg = mapping[action_type]
+        target_id = roster.get(key)
+        if target_id:
+            worker_keyboard = [[InlineKeyboardButton("✅ Mark as Resolved", callback_data=f"worker_resolve_{sheet_row}")]]
+            await context.bot.send_message(chat_id=target_id, text=f"📥 **Incoming Work Order Assignment:**\n\n{original_text}", reply_markup=InlineKeyboardMarkup(worker_keyboard))
+            await query.edit_message_text(text=f"{original_text}\n\n✅ {msg}")
+        else:
+            await query.edit_message_text(text=f"{original_text}\n\n⚠️ **Routing Failed:** Could not find ID for '{name}' in Roster.", reply_markup=current_keyboard)
     else:
         await query.edit_message_text(text=f"{original_text}\n\n🗑️ **Alert closed without routing.**")
-        return
-
-    if not target_id or target_id == 0:
-        await query.edit_message_text(
-            text=f"{original_text}\n\n⚠️ **Routing Failed:** Could not find an ID mapping for '{department_name}' in the Staff Roster tab.",
-            reply_markup=current_keyboard
-        )
-        return
-
-    try:
-        worker_keyboard = [[InlineKeyboardButton("✅ Mark as Resolved", callback_data=f"worker_resolve_{sheet_row}")]]
-        worker_markup = InlineKeyboardMarkup(worker_keyboard)
-
-        await context.bot.send_message(
-            chat_id=target_id,
-            text=f"📥 **Incoming Work Order Assignment:**\n\n{original_text}",
-            reply_markup=worker_markup 
-        )
-
-        await query.edit_message_text(text=f"{original_text}\n\n✅ {confirmation_msg}")
-    except Exception:
-        await query.edit_message_text(
-            text=f"{original_text}\n\n❌ **Routing Blocked:** {department_name} has not initialized or pressed 'Start' on this bot yet.",
-            reply_markup=current_keyboard
-        )
-
-
-# --- FLASK WEBSERVER (For Render Health Checks) ---
-app_flask = Flask('')
-
-@app_flask.route('/')
-def home():
-    return "Bot is alive!"
 
 def run_flask():
-    # Render requires binding to 0.0.0.0 and defaults to port 10000 if not specified via env
     port = int(os.environ.get("PORT", 8080))
     app_flask.run(host='0.0.0.0', port=port)
 
+app_flask = Flask('')
+@app_flask.route('/')
+def home(): return "Bot is alive!"
 
-# --- MAIN STARTUP LOGIC ---
 if __name__ == '__main__':
-    # 1. Start the Flask server in a background thread FIRST
     Thread(target=run_flask).start()
-
-    # 2. Build the Telegram Bot
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    app = Application.builder().token(token).build()
+    
+    # --- FIX: Add drop_pending_updates(True) to clear stale backlog ---
+    app = Application.builder().token(token).drop_pending_updates(True).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(execute_dispatch_routing))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_staff_report))
 
     print("🚀 Multi-Hotel Tracking System Engine Online. Running...")
-
-    # 3. Explicitly set up the asyncio event loop for Python 3.14+
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    # 4. Run the bot (this blocks the main thread, which is why Flask needed to start earlier)
     app.run_polling()
