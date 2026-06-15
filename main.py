@@ -1,7 +1,10 @@
 import os
 import json
 import logging
+import asyncio
 from datetime import datetime
+from threading import Thread
+from flask import Flask
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
@@ -38,11 +41,18 @@ class HotelIssue(BaseModel):
 # 3. Instantiate Google API Clients
 gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
+# Fix: Load Google Credentials directly from Render Environment Variable
 try:
-    gc = gspread.service_account(filename="credentials.json")
-    spreadsheet = gc.open("Hotel_Operations_Log")
-    sheet = spreadsheet.worksheet("Active_Issues")
-    print("✅ Database Connection Established. Google Sheets connected successfully!")
+    google_creds = os.environ.get('GOOGLE_CREDENTIALS')
+    if google_creds:
+        creds_dict = json.loads(google_creds)
+        gc = gspread.service_account_from_dict(creds_dict)
+        spreadsheet = gc.open("Hotel_Operations_Log")
+        sheet = spreadsheet.worksheet("Active_Issues")
+        print("✅ Database Connection Established. Google Sheets connected successfully!")
+    else:
+        print("❌ Error: GOOGLE_CREDENTIALS environment variable not found. Check Render Dashboard.")
+        sheet = None
 except Exception as e:
     import traceback
     logger.error(f"Google Sheets Auth Error: {str(e)}.")
@@ -92,7 +102,6 @@ async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYP
         # Step 2: Log data into Google Sheets and find out exactly what row it landed on
         target_row_index = 0
         if sheet:
-            # Appending returns information about the updated spreadsheet range
             update_res = sheet.append_row([
                 timestamp,
                 combined_location,
@@ -102,12 +111,10 @@ async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYP
                 sender,
                 "Pending"
             ])
-            # Parse row tracking number from the gspread grid updates response
             try:
                 updated_range = update_res.get('updates', {}).get('updatedRange', '')
                 target_row_index = int(updated_range.split('A')[-1].split(':')[0])
             except Exception:
-                # Fallback calculation if gspread API range shapes change
                 target_row_index = len(sheet.get_all_values())
 
         # Build message string block
@@ -124,7 +131,6 @@ async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYP
 
         await status_indicator.edit_text("✅ Report successfully registered into administration console.")
 
-        # Embed the row index into the button data path strings so the dispatch function can remember it
         keyboard = [
             [
                 InlineKeyboardButton("🧹 Housekeeping", callback_data=f"disp_housekeeping_{target_row_index}"),
@@ -164,13 +170,10 @@ async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT
 
         try:
             if sheet and sheet_row.isdigit():
-                # Column G is row element index 7 (Status Column)
                 sheet.update_cell(int(sheet_row), 7, "Resolved")
 
-            # Wipe buttons out of the worker's DM entirely to prevent accidental re-clicking
             await query.edit_message_text(text=f"{original_text}\n\n✅ **Status: Marked as Resolved**")
 
-            # Send an explicit notification loop update to your Aunt's console automatically!
             await context.bot.send_message(
                 chat_id=AUNT_ID,
                 text=f"🍏 **Update:** A task has been marked as **Resolved**!\n\n{original_text}"
@@ -195,10 +198,8 @@ async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT
         logger.error(f"Spreadsheet Roster read error: {err}")
         roster = {}
 
-    # Extract target row index from the incoming prefix string pattern
-    # format strings look like: "disp_housekeeping_14"
     parts = selection_path.split("_")
-    action_type = f"{parts[0]}_{parts[1]}" # e.g. "disp_housekeeping"
+    action_type = f"{parts[0]}_{parts[1]}"
     sheet_row = parts[2] if len(parts) > 2 else "0"
 
     if action_type == "disp_maintenance":
@@ -228,7 +229,6 @@ async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT
         )
         return
 
-    # Forward instruction packet to the department, and hand them a dynamic 'Resolve' button
     try:
         worker_keyboard = [[InlineKeyboardButton("✅ Mark as Resolved", callback_data=f"worker_resolve_{sheet_row}")]]
         worker_markup = InlineKeyboardMarkup(worker_keyboard)
@@ -236,10 +236,9 @@ async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT
         await context.bot.send_message(
             chat_id=target_id,
             text=f"📥 **Incoming Work Order Assignment:**\n\n{original_text}",
-            reply_markup=worker_markup # Attach resolution option
+            reply_markup=worker_markup 
         )
 
-        # Confirm action completion cleanly on your Aunt's phone screen interface
         await query.edit_message_text(text=f"{original_text}\n\n✅ {confirmation_msg}")
     except Exception:
         await query.edit_message_text(
@@ -247,27 +246,8 @@ async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT
             reply_markup=current_keyboard
         )
 
-if __name__ == '__main__':
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    proxy_url = "http://proxy.server:3128"
-    app = (
-        Application.builder()
-        .token(token)
-        .proxy(proxy_url)
-        .get_updates_proxy(proxy_url)
-        .build()
-    )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(execute_dispatch_routing))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_staff_report))
-
-    print("🚀 Multi-Hotel Tracking System Engine Online. Running...")
-    app.run_polling()
-
-from threading import Thread
-from flask import Flask
-
+# --- FLASK WEBSERVER (For Render Health Checks) ---
 app_flask = Flask('')
 
 @app_flask.route('/')
@@ -275,7 +255,29 @@ def home():
     return "Bot is alive!"
 
 def run_flask():
-    app_flask.run(host='0.0.0.0', port=8080)
+    # Render requires binding to 0.0.0.0 and defaults to port 10000 if not specified via env
+    port = int(os.environ.get("PORT", 8080))
+    app_flask.run(host='0.0.0.0', port=port)
 
-# Inside your main execution block, spin up the server thread right before polling:
-Thread(target=run_flask).start()
+
+# --- MAIN STARTUP LOGIC ---
+if __name__ == '__main__':
+    # 1. Start the Flask server in a background thread FIRST
+    Thread(target=run_flask).start()
+
+    # 2. Build the Telegram Bot
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    app = Application.builder().token(token).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(execute_dispatch_routing))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_staff_report))
+
+    print("🚀 Multi-Hotel Tracking System Engine Online. Running...")
+
+    # 3. Explicitly set up the asyncio event loop for Python 3.14+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # 4. Run the bot (this blocks the main thread, which is why Flask needed to start earlier)
+    app.run_polling()
