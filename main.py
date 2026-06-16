@@ -123,7 +123,8 @@ async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYP
                 "Pending"
             ])
             try:
-                updated_range = update_res.get('updates', {}).get('updatedRange', '')
+                update_res_dict = dict(update_res) if not isinstance(update_res, dict) else update_res
+                updated_range = update_res_dict.get('updates', {}).get('updatedRange', '')
                 target_row_index = int(updated_range.split('A')[-1].split(':')[0])
             except Exception:
                 target_row_index = len(sheet.get_all_values())
@@ -225,24 +226,51 @@ async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT
     else:
         await query.edit_message_text(text=f"{original_text}\n\n🗑️ **Alert closed without routing.**")
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app_flask.run(host='0.0.0.0', port=port)
-
+# --- REWORKED: Flask implementation running alongside the async loop ---
 app_flask = Flask('')
-@app_flask.route('/')
-def home(): return "Bot is alive!"
 
-if __name__ == '__main__':
-    Thread(target=run_flask).start()
+@app_flask.route('/')
+def home(): 
+    return "Bot is alive!"
+
+def run_flask_sync():
+    """Runs Flask synchronously within an independent system thread cleanly."""
+    port = int(os.environ.get("PORT", 8080))
+    # use_reloader=False prevents Flask from spinning up extra child processes/threads
+    app_flask.run(host='0.0.0.0', port=port, use_reloader=False)
+
+async def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    
-    # --- FIX: Add drop_pending_updates(True) to clear stale backlog ---
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN environment variable is missing!")
+        return
+
+    # Start Flask entirely separate from the asynchronous event loop runtime
+    flask_thread = Thread(target=run_flask_sync, daemon=True)
+    flask_thread.start()
+    print("🌐 Web dummy endpoint successfully spawned.")
+
+    # Initialize Telegram Application
     app = Application.builder().token(token).drop_pending_updates(True).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(execute_dispatch_routing))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_staff_report))
 
-    print("🚀 Multi-Hotel Tracking System Engine Online. Running...")
-    app.run_polling()
+    # Initialize, start, and dynamically yield processing execution control loops
+    async with app:
+        await app.initialize()
+        await app.start()
+        print("🚀 Multi-Hotel Tracking System Engine Online. Polling updates asynchronously...")
+        await app.updater.start_polling(drop_pending_updates=True)
+        
+        # Keeps the async loop alive continuously without freezing up system processes
+        while True:
+            await asyncio.sleep(3600)
+
+if __name__ == '__main__':
+    # Force python-telegram-bot to run on a clean, decoupled execution stack
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("🤖 Bot cleanly disconnected.")
