@@ -85,21 +85,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Add this ID to your server's roster configurations to receive direct dispatches."
     )
 
-async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Intercepts messy worker strings, uses Gemini to clean up records, and generates logs."""
+async def process_single_issue(issue_text: str, sender: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process a single issue report and log it."""
     global sheet
-    # --- FIX: Re-check connection if lost ---
-    if sheet is None: connect_google()
-
-    raw_text = update.message.text
-    sender = update.message.from_user.first_name
-
-    status_indicator = await update.message.reply_text("🔄 AI processing incident parameters...")
-
+    
     try:
         response = gemini_client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=f"Staff Member: {sender}\nReport: {raw_text}",
+            contents=f"Staff Member: {sender}\nReport: {issue_text}",
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=HotelIssue,
@@ -140,8 +133,6 @@ async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYP
             f"⏰ **Timestamp:** {timestamp}"
         )
 
-        await status_indicator.edit_text("✅ Report successfully registered into administration console.")
-
         keyboard = [
             [
                 InlineKeyboardButton("🧹 Housekeeping", callback_data=f"disp_housekeeping_{target_row_index}"),
@@ -163,8 +154,35 @@ async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
     except Exception as e:
-        logger.error(f"Failed to process message step: {str(e)}")
-        await status_indicator.edit_text("❌ Data tracking failure. System failed to structure input.")
+        logger.error(f"Failed to process issue: {str(e)}")
+
+async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Intercepts messy worker strings, uses Gemini to clean up records, and generates logs. Supports bulk reporting."""
+    global sheet
+    # --- FIX: Re-check connection if lost ---
+    if sheet is None: connect_google()
+
+    raw_text = update.message.text
+    sender = update.message.from_user.first_name
+
+    # Split by dash for bulk reporting support
+    issues = [issue.strip() for issue in raw_text.split('-') if issue.strip()]
+    
+    if len(issues) == 0:
+        await update.message.reply_text("❌ No issues detected. Please use format: -Issue 1\n-Issue 2")
+        return
+    
+    if len(issues) == 1:
+        # Single issue - original behavior
+        status_indicator = await update.message.reply_text("🔄 AI processing incident parameters...")
+        await process_single_issue(raw_text, sender, update, context)
+        await status_indicator.edit_text("✅ Report successfully registered into administration console.")
+    else:
+        # Bulk reporting mode
+        status_indicator = await update.message.reply_text(f"🔄 Processing {len(issues)} incident(s)...")
+        for issue_text in issues:
+            await process_single_issue(issue_text, sender, update, context)
+        await status_indicator.edit_text(f"✅ All {len(issues)} report(s) successfully registered into administration console!")
 
 async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Monitors clicks on administrative dispatch menus and worker resolutions."""
