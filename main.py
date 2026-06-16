@@ -73,7 +73,10 @@ SYSTEM_INSTRUCTION = (
     "You are an expert multi-property hotel operations routing manager. Your task is to analyze raw "
     "messages from floor staff, normalize formatting, and extract properties into the specified schema. "
     "Pay extremely close attention to which specific hotel property/branch is mentioned in the text (such as "
-    "Mango Valley) and isolate it cleanly from the room number or physical area."
+    "Mango Valley, Shoreline, Bayfront, Apex, etc.) and isolate it cleanly from the room number or physical area. "
+    "If the hotel name is unclear or ambiguous (e.g., 'Dead Rat' is not a hotel name), use the clearest location mentioned "
+    "as the hotel_name, or use 'Unknown' as a last resort. Always extract a room_number even if it's 'Unknown'. "
+    "For issue_type, if it involves pests or animals, classify as 'Maintenance'. Be lenient with parsing."
 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -85,8 +88,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Add this ID to your server's roster configurations to receive direct dispatches."
     )
 
-async def process_single_issue(issue_text: str, sender: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process a single issue report and log it."""
+async def process_single_issue(issue_text: str, sender: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[bool, str]:
+    """Process a single issue report and log it. Returns (success, error_message)."""
     global sheet
     
     try:
@@ -101,17 +104,35 @@ async def process_single_issue(issue_text: str, sender: str, update: Update, con
         )
 
         parsed_data = json.loads(response.text)
+        
+        # Validate and sanitize parsed data
+        hotel_name = str(parsed_data.get('hotel_name', 'Unknown')).strip() or 'Unknown'
+        room_number = str(parsed_data.get('room_number', 'Unknown')).strip() or 'Unknown'
+        issue_type = str(parsed_data.get('issue_type', 'Other')).strip() or 'Other'
+        urgency = str(parsed_data.get('urgency', 'Low')).strip() or 'Low'
+        description = str(parsed_data.get('description', issue_text)).strip() or issue_text
+        
+        # Ensure issue_type is one of the allowed values
+        valid_types = ['Plumbing', 'Electrical', 'HVAC', 'Housekeeping', 'Maintenance', 'Other']
+        if issue_type not in valid_types:
+            issue_type = 'Other'
+        
+        # Ensure urgency is one of the allowed values
+        valid_urgencies = ['Low', 'Medium', 'High']
+        if urgency not in valid_urgencies:
+            urgency = 'Medium'
+        
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        combined_location = f"{parsed_data.get('hotel_name')} - {parsed_data.get('room_number')}"
+        combined_location = f"{hotel_name} - {room_number}"
 
         target_row_index = 0
         if sheet:
             update_res = sheet.append_row([
                 timestamp,
                 combined_location,
-                parsed_data.get('issue_type'),
-                parsed_data.get('urgency'),
-                parsed_data.get('description'),
+                issue_type,
+                urgency,
+                description,
                 sender,
                 "Pending"
             ])
@@ -124,11 +145,11 @@ async def process_single_issue(issue_text: str, sender: str, update: Update, con
 
         alert_payload = (
             f"🚨 **New Operational Report**\n\n"
-            f"🏨 **Hotel Property:** {parsed_data.get('hotel_name')}\n"
-            f"📍 **Room / Area:** {parsed_data.get('room_number')}\n"
-            f"🏷️ **Category:** {parsed_data.get('issue_type')}\n"
-            f"⚠️ **Urgency Level:** {parsed_data.get('urgency')}\n"
-            f"📝 **Description:** {parsed_data.get('description')}\n"
+            f"🏨 **Hotel Property:** {hotel_name}\n"
+            f"📍 **Room / Area:** {room_number}\n"
+            f"🏷️ **Category:** {issue_type}\n"
+            f"⚠️ **Urgency Level:** {urgency}\n"
+            f"📝 **Description:** {description}\n"
             f"👤 **Log Source:** {sender}\n"
             f"⏰ **Timestamp:** {timestamp}"
         )
@@ -152,9 +173,12 @@ async def process_single_issue(issue_text: str, sender: str, update: Update, con
             parse_mode="Markdown",
             reply_markup=reply_markup
         )
+        return (True, "")
 
     except Exception as e:
-        logger.error(f"Failed to process issue: {str(e)}")
+        error_msg = str(e)
+        logger.error(f"Failed to process issue '{issue_text}': {error_msg}")
+        return (False, error_msg)
 
 async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Intercepts messy worker strings, uses Gemini to clean up records, and generates logs. Supports bulk reporting."""
@@ -175,14 +199,30 @@ async def process_staff_report(update: Update, context: ContextTypes.DEFAULT_TYP
     if len(issues) == 1:
         # Single issue - original behavior
         status_indicator = await update.message.reply_text("🔄 AI processing incident parameters...")
-        await process_single_issue(raw_text, sender, update, context)
-        await status_indicator.edit_text("✅ Report successfully registered into administration console.")
+        success, error = await process_single_issue(raw_text, sender, update, context)
+        if success:
+            await status_indicator.edit_text("✅ Report successfully registered into administration console.")
+        else:
+            await status_indicator.edit_text(f"❌ Data tracking failure. System failed to structure input.\nError: {error}")
     else:
         # Bulk reporting mode
         status_indicator = await update.message.reply_text(f"🔄 Processing {len(issues)} incident(s)...")
-        for issue_text in issues:
-            await process_single_issue(issue_text, sender, update, context)
-        await status_indicator.edit_text(f"✅ All {len(issues)} report(s) successfully registered into administration console!")
+        
+        results = []
+        for i, issue_text in enumerate(issues, 1):
+            success, error = await process_single_issue(issue_text, sender, update, context)
+            if success:
+                results.append(f"✅ Issue {i}: Registered")
+            else:
+                results.append(f"❌ Issue {i}: Failed - {error}")
+        
+        summary = "\n".join(results)
+        successful = sum(1 for s in results if s.startswith("✅"))
+        
+        if successful == len(issues):
+            await status_indicator.edit_text(f"✅ All {len(issues)} report(s) successfully registered into administration console!\n\n{summary}")
+        else:
+            await status_indicator.edit_text(f"⚠️ Partially processed: {successful}/{len(issues)} reports registered.\n\n{summary}")
 
 async def execute_dispatch_routing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Monitors clicks on administrative dispatch menus and worker resolutions."""
