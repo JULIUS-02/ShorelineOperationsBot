@@ -251,7 +251,7 @@ async def main():
     print("🌐 Web dummy endpoint successfully spawned.")
 
     # Initialize Telegram Application
-    app = Application.builder().token(token).drop_pending_updates(True).build()
+    app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(execute_dispatch_routing))
